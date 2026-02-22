@@ -1,0 +1,44 @@
+# conf/config.yaml
+defaults:
+  - dataset: null
+  - logging: simple
+
+device: "cuda:0"
+
+training:
+  checkpoint_path: null
+  batch_size: 1024
+  num_workers: 8
+  persistent_workers: True
+  pin_memory: False
+  epochs: 1000
+  lr: 1e-4
+  weight_decay: 1e-7
+  gamma: 0.995
+  grad_clip: null
+  num_chunks: 1
+  eps: 1e-6
+  ridge: 1e-3
+
+scheduler:
+  pretrained: null
+  start: 0
+  num_train_timesteps: 1000
+  step: 1
+  beta_start: 0.0001
+  beta_end: 0.02
+  beta_schedule: linear
+
+model:
+  num_eigenfunctions: 256
+  time_emb_dim: 256       
+  base_channels: 64
+  channel_mults: [1, 2, 4, 8]
+  min_resolution: 8
+  max_channels: 512
+
+hydra:
+  run:
+    dir: ./runs/${dataset.name}/phi_${scheduler.num_train_timesteps}-${scheduler.step}_k${model.num_eigenfunctions}_chunks${training.num_chunks}
+  job:
+    chdir: true

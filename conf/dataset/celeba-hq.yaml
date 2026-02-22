@@ -1,0 +1,3 @@
+name: celeba-hq
+image_size: 256
+cache_dir: /home/gmoreira/.cache
