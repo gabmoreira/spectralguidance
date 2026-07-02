@@ -3,6 +3,7 @@ import time
 import torch
 import logging
 import numpy as np
+
 from pathlib import Path
 from torch import Tensor
 from omegaconf import OmegaConf
@@ -59,6 +60,7 @@ class SpectralGuidance:
         self._pipeline.to(device)
         self._pipeline.unet.to(device, dtype=self._dtype)
         self._pipeline.unet.eval()
+
         if xformers:
             self._pipeline.unet.enable_xformers_memory_efficient_attention() 
         logger.info(
@@ -165,8 +167,8 @@ class SpectralGuidance:
         num_samples: int,
         guidance_strength: float,
         eta: float,
+        batch_size: int,
         return_posterior_mean: bool = False,
-        batch_size: int = 16,
         guidance_tmin: int = 0,
         guidance_tmax: int = 1000,
         grad_clip_min: float = 0.1, 
@@ -281,6 +283,7 @@ class SpectralGuidance:
                 phi_x = self._phi_encoder.forward_whitened(x, t_batch) # shape (num_samples, K)
                 probs = phi_x[:, -top_k:] @ c[-top_k:] / phi_x[:, -top_k:].pow(2).sum(-1).sqrt() # shape (self._n,)
                 probs.backward(torch.ones_like(probs))
+                
                 grad_log_p = x.grad.detach() / probs.detach().view(-1,1,1,1)
                 grad_norm = grad_log_p.flatten(1, 3).norm(dim=1).view(-1,1,1,1)
                 grad_norm_clamped = torch.clamp(grad_norm, min=grad_clip_min, max=grad_clip_max)
@@ -288,7 +291,7 @@ class SpectralGuidance:
 
                 current_alpha_bar = self._pipeline.scheduler.alphas_cumprod[t]
                 sigma_t = (1 - current_alpha_bar)
-                guidance = guidance_strength * guidance_score * sigma_t**2
+                guidance = guidance_strength * guidance_score * sigma_t.sqrt()
                 x = x + guidance
                 x = x.detach()
                 logger.debug("Step t=%d applied spectral guidance", t)
