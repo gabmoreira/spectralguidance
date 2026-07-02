@@ -10,7 +10,7 @@ def save_eigenvalue_plot(
     save_path: str,
     step: int,
     writer,
-):
+) -> None:
     evals = []
     ts = []
     for t, eigenvalues in eigenvalues_t.items():

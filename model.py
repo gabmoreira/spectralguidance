@@ -29,16 +29,16 @@ class TimeConditionedResBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         time_emb_dim: int,
-        groups=32
+        groups: int=32,
+        dropout: float=0.0,
     ) -> None:
         super().__init__()
         
         self.norm1 = nn.GroupNorm(groups, in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
-        # Projection for time embedding to scale/shift the features
         self.time_proj = nn.Linear(time_emb_dim, out_channels * 2)
-        
+        self.dropout = nn.Dropout(p=dropout)
         self.norm2 = nn.GroupNorm(groups, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         
@@ -60,11 +60,11 @@ class TimeConditionedResBlock(nn.Module):
         t_emb = t_emb[:, :, None, None]
         scale, shift = t_emb.chunk(2, dim=1)
         
-        # Modulate
+
         h = h * (1 + scale) + shift
-        
         h = self.norm2(h)
         h = F.silu(h)
+        h = self.dropout(h)
         h = self.conv2(h)
         
         return h + self.shortcut(x)
@@ -80,13 +80,18 @@ class TimeConditionedEncoder(nn.Module):
         min_resolution: int,
         max_channels: int,
         num_train_timesteps: int,
+        num_res_blocks: int = 1,
+        dropout: float = 0.0,
+        append_last: bool = False,
+        pooling: str = "average",
         num_timesteps: Optional[int] = None,
     ) -> None:
         super().__init__()
         
         assert image_size & (image_size - 1) == 0, "image_size must be power of 2"
         self.num_train_timesteps = num_train_timesteps
-
+        self.pooling = pooling
+    
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 4),
@@ -102,16 +107,38 @@ class TimeConditionedEncoder(nn.Module):
         for i in range(num_downs):
             mult = channel_mults[min(i, len(channel_mults) - 1)]
             out_ch = min(base_channels * mult, max_channels)
-            downs.append(TimeConditionedResBlock(in_ch, out_ch, time_emb_dim))
-            downs.append(nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1))
-            in_ch = out_ch
+            for _ in range(num_res_blocks):
+                downs.append(TimeConditionedResBlock(in_ch, out_ch, time_emb_dim, dropout=dropout))
+                in_ch = out_ch
+            
+            downs.append(nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1))
 
+        if append_last:
+            if num_downs < len(channel_mults):
+                for i in range(num_downs, len(channel_mults)):
+                    mult = channel_mults[i]
+                    out_ch = min(base_channels * mult, max_channels)
+                    for _ in range(num_res_blocks):
+                        downs.append(TimeConditionedResBlock(in_ch, out_ch, time_emb_dim, dropout=dropout))
+                        in_ch = out_ch
         self.downs = nn.ModuleList(downs)
-        
         self.norm_out = nn.GroupNorm(32, in_ch)
-        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(in_ch, out_dim)
 
+        # --------- Pooling ---------
+        if self.pooling == "average":
+            self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(in_ch, out_dim)
+        elif self.pooling == "attention":
+            self.attn_pool = AttentionPool2d(in_channels=in_ch, out_channels=out_dim, num_heads=8)
+        else:
+            self.avg_pool = nn.AdaptiveAvgPool2d((2, 2))
+            self.fc = nn.Sequential(
+                nn.Linear(in_ch * 4, 2048),
+                nn.SiLU(),
+                nn.Linear(2048, out_dim),
+            )
+        # --------------------------
+            
         if num_timesteps:
             self.register_buffer("whiten_timesteps", torch.zeros(num_timesteps, dtype=torch.long))
             self.register_buffer("whiten_w", torch.zeros((num_timesteps, out_dim, out_dim)))
@@ -157,6 +184,7 @@ class TimeConditionedEncoder(nn.Module):
         x: (B, 3, 256, 256)
         timesteps: (B,) tensor of ints or floats
         """
+        # model always receives t in [0, 1000]
         timesteps = timesteps.float() * (1000.0 / self.num_train_timesteps)
 
         t_emb = self.time_mlp(timesteps)
@@ -170,7 +198,40 @@ class TimeConditionedEncoder(nn.Module):
         
         x = self.norm_out(x)
         x = F.silu(x)
-        x = self.avg_pool(x) # (B, C, 1, 1)
-        x = x.flatten(1)     # (B, C)
-        x = self.fc(x)       # (B, k)
+
+        if self.pooling == "average":
+            x = self.avg_pool(x) # (B, C, 1, 1)
+            x = x.flatten(1)     # (B, C)
+            x = self.fc(x)       # (B, K)
+        elif self.pooling == "attention":
+            x = self.attn_pool(x)
+        else:
+            x = self.avg_pool(x) # (B, C, 2, 2)
+            x = x.flatten(1)     # (B, C * 4)
+            x = self.fc(x)       # (B, K)
         return x
+
+class AttentionPool2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, num_heads: int = 8):
+        super().__init__()
+        # Learnable query vector (similar to a CLS token)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, in_channels))
+        self.mha = nn.MultiheadAttention(embed_dim=in_channels, num_heads=num_heads, batch_first=True)
+        self.proj = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Height, Width)
+        B, C, H, W = x.shape
+        
+        # Flatten spatial dimensions: (B, C, H*W) -> (B, H*W, C)
+        x = x.view(B, C, H * W).permute(0, 2, 1)
+        
+        # Expand the learnable CLS token for the whole batch: (B, 1, C)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        
+        # The CLS token (Query) attends to the spatial features (Key/Value)
+        attn_out, _ = self.mha(query=cls_tokens, key=x, value=x)
+        
+        # (B, 1, C) -> (B, C)
+        attn_out = attn_out.squeeze(1)
+        return self.proj(attn_out)

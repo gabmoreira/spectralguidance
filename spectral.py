@@ -1,102 +1,76 @@
 import torch
+import torch.distributed as dist
 import logging
 from torch import Tensor
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
 def whitening(
-    x: Tensor, 
-    eps: float, 
+    x: torch.Tensor,
     ridge: float,
-) -> Tuple[Tensor, Tensor]:
+    return_eig: bool = False,
+) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
     """
-    Computes the centering mean and the ZCA-style whitening matrix.
+    Computes centering mean and whitening matrix.
     
-    Uses Symmetric Eigendecomposition (eigh) to find the inverse square root 
-    of the covariance matrix. Includes robust error handling for rank-deficient 
-    or unstable matrices.
+    Single-GPU: SVD on the centered data matrix (better condition number).
+    Distributed: all-reduce scatter matrix then eigh on the global covariance
+                 (SVD requires the full data matrix, which doesn't exist globally).
+
     Args:
-        x: Features of shape (B, K).
-        eps: Small scalar for numerical stability.
-        ridge: Ridge factor so that cov is not singular.
+        x: (N, K) feature matrix (local shard in distributed mode)
+        ridge: ridge regularization (acts like eigenvalue floor)
 
     Returns:
-        eigenvalues: Tensor of shape (K,) representing the diagonalized correlations.
+        mu: (1, K) mean
+        cov_inv_sqrt: (K, K) whitening matrix
     """
     dtype = x.dtype
-    device = x.device
-    n_samples = x.shape[0]
-    n_features = x.shape[1]
 
-    # Centering
-    mu = x.mean(dim=0, keepdim=True)
-    x_c = x - mu
+    if dist.is_initialized():
+        n_local  = torch.tensor(len(x), device=x.device, dtype=dtype)
+        sum_local = x.sum(0)                               # (K,)
+        dist.all_reduce(n_local, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_local, op=dist.ReduceOp.SUM)
+        n_global = n_local
+        mu = (sum_local / n_global).unsqueeze(0)           # (1, K)
 
-    # Covariance Calculation
-    cov = (x_c.T @ x_c) / (n_samples - 1) # (K, K)
-    cov = 0.5 * (cov + cov.T)
-    ridge_id = ridge * torch.eye(n_features, device=device, dtype=cov.dtype)
-    matrix_to_decompose = cov + ridge_id
+        x_c = x - mu
+        S = x_c.T @ x_c                                    # (K, K) local scatter
+        dist.all_reduce(S, op=dist.ReduceOp.SUM)           # global scatter
+        C = S / (n_global - 1)                             # (K, K) global covariance
+        I = torch.eye(C.shape[0], device=C.device)
 
-    try:
-        s, U = torch.linalg.eigh(matrix_to_decompose)
-    except (RuntimeError, torch._C._LinAlgError):
-        logger.warning("linalg.eigh failed, attempting fallback with increased ridge")
-        # Fallback: Move to float64 and increase regularization
-        matrix_f64 = matrix_to_decompose.to(torch.float64)
-        ridge_extra = (ridge * 10) * torch.eye(n_features, device=device, dtype=torch.float64)
-        s, U = torch.linalg.eigh(matrix_f64 + ridge_extra)
-        s, U = s.to(dtype), U.to(dtype)
+        try:
+            L, V = torch.linalg.eigh(C + ridge * I)
+        except RuntimeError:
+            logger.info("torch.linalg.eigh failed to converge")
+            U, S, _ = torch.linalg.svd((C + ridge * I).to(torch.float64))
+            L, V = S.flip(-1).to(dtype), U.flip(-1).to(dtype)
 
-    s_stable = torch.clamp(s, min=s.max().item() * 1e-12 + eps)
-    inv_sqrt_s = torch.diag(1.0 / torch.sqrt(s_stable))
-    cov_inv_sqrt = (U @ inv_sqrt_s).to(dtype)
-    return mu, cov_inv_sqrt
-     
-def compute_eigenvalues(
-    x: Tensor,
-    y: Tensor,
-    mu: Tensor,
-    whitener: Tensor,
-    std: Optional[Tensor] = None,
-    normalize: bool = True,
-    eps: float = 1e-8,
-) -> Tensor:
-    """
-    Computes the approximate eigenvalues (correlations) between two sets of 
-    whitened features. 
+        scale = 1.0 / torch.sqrt(L.clamp(min=0.0))
+        W = (V @ torch.diag(scale)).to(dtype)
+        eigvals = (L - ridge).clamp(min=0.0)  # already ascending from eigh
 
-    In the context of the Courant-Fischer theorem, this estimates the 
-    Rayleigh quotient in the transformed feature space.
+    else:
+        n_samples = len(x)
+        mu = x.mean(dim=0, keepdim=True)
+        x_c = x - mu
 
-    Args:
-        x: First feature set of shape (B, K).
-        y: Second feature set of shape (B, K).
-        mu: Mean vector used for centering, shape (K,).
-        whitener: Whitening matrix (e.g., from ZCA or PCA), shape (K, K).
-        std: Optional pre-computed standard deviation for normalization.
-        normalize: Whether to scale features to unit variance.
-        eps: Small constant for numerical stability.
+        try:
+            _, S, Vh = torch.linalg.svd(x_c, full_matrices=False)
+        except RuntimeError:
+            x64 = x_c.to(torch.float64)
+            _, S, Vh = torch.linalg.svd(x64, full_matrices=False)
+            S, Vh = S.to(dtype), Vh.to(dtype)
 
-    Returns:
-        eigenvalues: Tensor of shape (K,) representing the diagonalized correlations.
-    """
-    # 1. Centering and Whitening (Linear Transformation)
-    # Using matmul (@) for (B, K) @ (K, K) -> (B, K)
-    x_w = (x - mu) @ whitener # (B, K)
-    y_w = (y - mu) @ whitener # (B, K)
+        V = Vh.transpose(-2, -1)
+        scale = 1.0 / torch.sqrt(S**2 / (n_samples - 1) + ridge)
+        W = (V @ torch.diag(scale)).to(dtype)
+        eigvals = (S**2 / (n_samples - 1)).flip(0).clamp(min=0.0)
 
-    # 2. Variance Normalization
-    if normalize:
-        if std is None:
-            x_w = x_w / (x_w.std(0, keepdim=True) + eps)
-            y_w = y_w / (y_w.std(0, keepdim=True) + eps)
-        else:
-            x_w = x_w / (std + eps)
-            y_w = y_w / (std + eps)
-
-    # 3. Correlation Estimation (eigenvalues)
-    eigenvalues = (x_w * y_w).mean(0)
-
-    return eigenvalues # (K,)
+    if return_eig:
+        return mu, W, eigvals
+    else:
+        return mu, W
