@@ -1,3 +1,3 @@
 name: celeba-hq-mask
 image_size: 256
-cache_dir: /home/gmoreira/.cache
+cache_dir:
