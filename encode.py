@@ -28,7 +28,6 @@ def encode_dataset(
     noise_scheduler: DDIMScheduler,
     loader: DataLoader,
     t: int,
-    eps: float,
     ridge: float,
     device: str = "cuda",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -50,7 +49,7 @@ def encode_dataset(
         phi.append(phi_encoder(x_t, t_batch))
     phi = torch.cat(phi)  
 
-    mu, w = whitening(phi, eps=eps, ridge=ridge) # (1, K), (K, K)
+    mu, w = whitening(phi, ridge=ridge) # (1, K), (K, K)
     phi = (phi - mu) @ w # (N, K)
     norm = phi.pow(2).mean(0, keepdim=True).sqrt() # (1, K)
     phi /= norm
@@ -74,8 +73,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """
-    python encode.py --device cuda --experiment_dir ./runs/celeba-hq-mask/phi_1000_1_k512_chunks16/ --batch_size 256 --num_workers 8 --pin_memory --tmin 10 --tmax 1000 --step 10
-    python encode.py --device cuda --experiment_dir ./runs/cifar10/phi_1000_1_k512_chunks2/ --batch_size 1024 --num_workers 8 --pin_memory --tmin 10 --tmax 1000 --step 10
+    python encode.py --device cuda --experiment_dir ./runs/celeba-hq-mask/phi_1000-1_k512_chunks16/ --batch_size 256 --num_workers 8 --pin_memory --tmin 10 --tmax 1000 --step 10
+    python encode.py --device cuda --experiment_dir ./runs/cifar10/phi_1000-1_k512_chunks2/ --batch_size 1024 --num_workers 8 --pin_memory --tmin 10 --tmax 1000 --step 10
     """
     args = parse_args()
     cfg = OmegaConf.load(os.path.join(args.experiment_dir, ".hydra/config.yaml"))
@@ -111,6 +110,10 @@ def main() -> None:
         channel_mults=cfg.model.channel_mults,
         min_resolution=cfg.model.min_resolution,
         max_channels=cfg.model.max_channels,
+        num_res_blocks=cfg.model.num_res_blocks,
+        append_last=cfg.model.append_last,
+        dropout=cfg.model.dropout,
+        pooling=cfg.model.pooling,
         num_train_timesteps=cfg.scheduler.num_train_timesteps,
     )
     phi_encoder.load_state_dict(state_dict)
@@ -129,7 +132,6 @@ def main() -> None:
             noise_scheduler=noise_scheduler,
             loader=loader,
             t=t,
-            eps=cfg.training.eps,
             ridge=cfg.training.ridge,
             device=args.device,
         )
