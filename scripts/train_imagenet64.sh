@@ -1,25 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=train_eigen
-#SBATCH --output=logs/%x-%j.out
-#SBATCH --error=logs/%x-%j.err
-#SBATCH --partition=general
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=80G
-#SBATCH --time=48:00:00
 
 mkdir -p logs
-source /home/gmoreira/.env312/bin/activate
 
 echo "CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 nvidia-smi -i $CUDA_VISIBLE_DEVICES
 
-python ./train.py \
+torchrun --nproc_per_node=4 ./train.py \
     dataset=imagenet64 \
-    training.batch_size=2048 \
+    training.name="eps1e-6" \
+    training.batch_size=4096 \
     training.num_chunks=3 \
-    model.num_eigenfunctions=700 \
-    model.base_channels=256 \
+    training.num_workers=4 \
+    model.num_eigenfunctions=2000 \
+    model.time_emb_dim=512 \
+    model.base_channels=128 \
+    model.channel_mults=[1,2,4,8,16] \
+    model.max_channels=2048 \
+    model.append_last=True \
     scheduler.beta_schedule="squaredcos_cap_v2" \
     scheduler.num_train_timesteps=4000 \
     scheduler.step=10
