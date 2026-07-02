@@ -1,11 +1,13 @@
 # conf/config.yaml
 defaults:
+  - _self_
   - dataset: null
   - logging: simple
 
 device: "cuda:0"
 
 training:
+  name: ""
   checkpoint_path: null
   batch_size: 1024
   num_workers: 8
@@ -17,8 +19,11 @@ training:
   gamma: 0.995
   grad_clip: null
   num_chunks: 1
-  eps: 1e-6
   ridge: 1e-3
+
+eval:
+  t: null
+  label_indices: []
 
 scheduler:
   pretrained: null
@@ -36,9 +41,13 @@ model:
   channel_mults: [1, 2, 4, 8]
   min_resolution: 8
   max_channels: 512
+  num_res_blocks: 1
+  append_last: False
+  pooling: average
+  dropout: 0.0
 
 hydra:
   run:
-    dir: ./runs/${dataset.name}/phi_${scheduler.num_train_timesteps}-${scheduler.step}_k${model.num_eigenfunctions}_chunks${training.num_chunks}
+    dir: ./runs/${dataset.name}/phi_${scheduler.num_train_timesteps}-${scheduler.step}_k${model.num_eigenfunctions}_chunks${training.num_chunks}_ridge${training.ridge}_epochs${training.epochs}_${training.name}
   job:
     chdir: true
