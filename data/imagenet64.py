@@ -1,8 +1,13 @@
+import os
+import json
 import pickle
 import numpy as np
+import logging
 from PIL import Image
 from torchvision import transforms
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 def imagenet_transform(augment: bool):
     if augment:
@@ -24,25 +29,56 @@ def imagenet_transform(augment: bool):
         ])
     return transform
 
+def load_imagenet_label_map(file_path):
+    """
+    Creates a mapping from the 0-indexed targets 
+    to human-readable strings.
+    """
+    idx_to_name = {}
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            # The file format is: WNID NumericID HumanName
+            # Example: n02119789 1 kit_fox
+            parts = line.strip().split()
+            
+            wnid = parts[0]
+            numeric_id = int(parts[1])
+            human_name = " ".join(parts[2:]).replace('_', ' ')
+            
+            idx_to_name[numeric_id - 1] = human_name
+            
+    return idx_to_name
+    
+
 class ImageNet64(Dataset):
-    def __init__(self, split: str, augment: bool, cache_dir: str):
-        self.data = []
-        self.targets = []
+    def __init__(self, split: str, augment: bool, cache_dir: str, class_list: list[int] | None = None):
         self.transform = imagenet_transform(augment)
+        
+        base_dir = f"{cache_dir}/imagenet64"
+        self.label_map = load_imagenet_label_map(f'{base_dir}/map_clsloc.txt')
 
-        file_list = [cache_dir + f"/imagenet64/train_data_batch_{i}" for i in range(1,11)]
-
-        for file_path in file_list:
-            with open(file_path, 'rb') as f:
+        self.data, self.targets = [], []
+        for i in range(1, 11):
+            logger.info(f"Loading {base_dir}/train_data_batch_{i}")
+            with open(f"{base_dir}/train_data_batch_{i}", 'rb') as f:
                 entry = pickle.load(f, encoding='latin1')
                 self.data.append(entry['data'])
-                # Labels in ImageNet 32/64 are often 1-indexed; 
-                # subtract 1 to make them 0-indexed for PyTorch
                 self.targets.extend([label - 1 for label in entry['labels']])
+        self.data = np.vstack(self.data).reshape(-1, 3, 64, 64).transpose((0, 2, 3, 1))
 
-        self.data = np.vstack(self.data).reshape(-1, 3, 64, 64)
-        # Transpose to (N, H, W, C) so PIL can read it easily before transforms
-        self.data = self.data.transpose((0, 2, 3, 1))
+        self.class_to_indices = json.load(open(f"{base_dir}/class_index.json"))
+        self.class_to_indices = {int(k): v for k, v in self.class_to_indices.items()}
+
+        if class_list is not None:
+            logger.info("Filtering classes")
+            class_set = set(class_list)
+            keep = np.array([i for i, t in enumerate(self.targets) if t in class_set])
+            self.data = self.data[keep]
+            self.targets = [self.targets[i] for i in keep]
+            self.class_to_indices = {}
+            for new_idx, t in enumerate(self.targets):
+                self.class_to_indices.setdefault(t, []).append(new_idx)
 
     def __len__(self):
         return len(self.data)
@@ -55,3 +91,4 @@ class ImageNet64(Dataset):
             img = self.transform(img)
 
         return img, target
+    

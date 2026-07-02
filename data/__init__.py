@@ -1,7 +1,7 @@
 from torchvision import transforms, datasets
 
 from .celebahq import CelebAHQMask
-from .imagenet64 import ImageNet64
+from .imagenet64 import ImageNet64, load_imagenet_label_map, imagenet_transform
 from .cifar10 import CIFAR10
     
 def get_dataset(dataset: str, split: str, augment: bool, cache_dir: str):
