@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
+import numpy as np
+import contextlib
 import torch
 import logging
 import torch.nn as nn
+import torch.distributed as dist
 
 from diffusers import DDIMScheduler
 from torch import Tensor
 from typing import Tuple, Optional
 from torch.nn.utils import clip_grad_norm_
-
-from spectral import compute_eigenvalues, whitening
+from spectral import whitening
 
 logger = logging.getLogger(__name__)
 
-def train_courant_fischer(
+def train_spectral_guidance(
     x_batch: Tensor,
     t_batch: Tensor,
     model: nn.Module,
@@ -20,158 +22,196 @@ def train_courant_fischer(
     num_chunks: int,
     optimizer: torch.optim.Optimizer,
     grad_clip: Optional[float],
-    eps: float,
     ridge: float,
-    autocast_enabled: bool = False, # Don't autocast -- use fp32
-) -> Tuple[Tensor, Tensor]:
-    """
-    Performs a training step using the Courant-Fischer eigenvalue loss.
-    
-    Args:
-        x_batch: Input data tensor of shape (B, *).
-        t_batch: Timestep tensor for the diffusion scheduler of shape (B,).
-        model: Encoder being trained (B, *) -> (B, K).
-        num_chunks: Number of chunks to split the batch for memory efficiency.
-        autocast_enabled: If True, uses torch.cuda.amp for mixed precision.
-    """
+    eps: float = 1e-6,
+    autocast_enabled: bool = False,
+) -> Tuple[float, Tensor, Tensor]:
+    is_distributed = dist.is_initialized()
     device = x_batch.device
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-    # Prepare noisy samples
     noise_a = torch.randn_like(x_batch)
     noise_b = torch.randn_like(x_batch)
     x_a = noise_scheduler.add_noise(x_batch, noise_a, t_batch)
     x_b = noise_scheduler.add_noise(x_batch, noise_b, t_batch)
 
-    # Chunking for memory management
     chunks_a = torch.chunk(x_a, num_chunks, dim=0)
     chunks_b = torch.chunk(x_b, num_chunks, dim=0)
     chunks_t = torch.chunk(t_batch, num_chunks, dim=0)
 
-    # Compute phi_a - no gradients
-    chunks_phi_a = []
-    for (chunk_a, chunk_t) in zip(chunks_a, chunks_t):
+    # Phase 1 — phi_a forward without grad, build whitening (global via all-reduce inside whitening())
+    phi_a_chunks = []
+    for chunk_a, chunk_t in zip(chunks_a, chunks_t):
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            chunk_phi_a = model(chunk_a, chunk_t)
-        chunks_phi_a.append(chunk_phi_a)
-        
-    phi_a = torch.cat(chunks_phi_a).float()
-    phi_a_mu, phi_a_whitener = whitening(phi_a, eps=eps, ridge=ridge)
+            phi_a_chunks.append(model(chunk_a, chunk_t).float())
+    phi_a = torch.cat(phi_a_chunks, dim=0)
 
-    # Compute phi_b and backpropagate
-    chunks_phi_b = []
+    if is_distributed:
+        torch.cuda.synchronize()
+
+    # Whitening is computed from all ranks
+    mu, W, cov_eig = whitening(phi_a, ridge=ridge, return_eig=True)
+    K = phi_a.shape[1]
+    n_chunks_total = len(phi_a_chunks)
+
+    # Phase 2 — per-chunk phi_b forward + per-chunk normalized-correlation loss + backward.
+    # std_a is detached (phi_a is detached anyway). std_b carries grad, computed per chunk.
     total_loss = 0.0
-    for (chunk_phi_a, chunk_b, chunk_t) in zip(chunks_phi_a, chunks_b, chunks_t):
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            chunk_phi_b = model(chunk_b, chunk_t)
-            chunks_phi_b.append(chunk_phi_b.detach())
+    eig_accum = torch.zeros(K, device=device)
 
-        eigenvalues = compute_eigenvalues(
-            chunk_phi_a.float(), # no-grad
-            chunk_phi_b.float(),
-            mu=phi_a_mu, # no-grad
-            whitener=phi_a_whitener, # no-grad
-            normalize=True,
-        )
-        
-        loss = (1.0 - eigenvalues.mean()) / num_chunks
-        loss.backward()
-        total_loss += loss.item()
-        
-    if grad_clip is not None:
-        clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+    for i, (chunk_phi_a, chunk_b, chunk_t) in enumerate(zip(phi_a_chunks, chunks_b, chunks_t)):
+        is_last = (i == n_chunks_total - 1)
+        ctx = contextlib.nullcontext() if (is_last or not is_distributed) else model.no_sync()
 
-    optimizer.step()
-    optimizer.zero_grad()       
+        with ctx:
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                chunk_phi_b = model(chunk_b, chunk_t).float()  # (chunk, K), grad here
 
-    # Final eval metrics on the full batch for logging
-    phi_b = torch.cat(chunks_phi_b)
-    eigenvalues = compute_eigenvalues(
-        phi_a.float().detach(),
-        phi_b.float().detach(),
-        mu=phi_a_mu,
-        whitener=phi_a_whitener,
-        normalize=True,
-    )
-    
-    return total_loss, eigenvalues
+            a_w = (chunk_phi_a - mu) @ W   # (chunk, K), no grad
+            b_w = (chunk_phi_b - mu) @ W   # (chunk, K), grad
 
+            # Per-chunk per-column std. a_w.std is detached (no grad from it). b_w.std carries grad.
+            s_a = a_w.std(dim=0, keepdim=True) + eps   # (1, K), no grad
+            s_b = b_w.std(dim=0, keepdim=True) + eps   # (1, K), grad   
 
-def train_eckart_young(
-    x_batch: Tensor,
-    t_batch: Tensor,
-    model: nn.Module,
-    noise_scheduler: DDIMScheduler,
-    optimizer,
-    grad_clip: float,
-) -> Tuple[Tensor, Tensor]:
-    """
-    Performs a single training step using the Eckart-Young-Mirksy Loss
-    to learn the leading eigenspace of the diffusion's covariance operator.
-    
-    Objective:
-        L = || T_t T_t^\ast - Phi @ Phi.T ||_HS
-          = const - 2 * E[ <Phi, Phi> ] + || Phi ||_HS^2
+            a_wn = a_w / s_a
+            b_wn = b_w / s_b
 
-    Args:
-        x_batch (Tensor): Clean data batch (x0). Shape: (B, C, H, W) or (B, D).
-        t_batch (Tensor): Timesteps for the noise scheduler. Shape: (B,).
-        model (nn.Module): The backbone neural network. Output must be (B, K).
-        noise_scheduler (DDIMScheduler): Scheduler for adding noise.
-        optimizer (Optimizer): The torch optimizer.
-        grad_clip (float, optional): Max norm for gradient clipping. Defaults to 1.0.
+            # Normalized per-coordinate cross-correlation, mean over K gives the loss.
+            eigvals_chunk = (a_wn * b_wn).mean(dim=0)                  # (K,)
+            loss = -eigvals_chunk.mean() / n_chunks_total
+            loss.backward()
+            total_loss += loss.item()
 
-    Returns:
-        loss (float): The scalar loss value for logging.
-        eigenvalues (Tensor): The estimated eigenvalues of the operator
-                              computed via post-hoc whitening. Shape: (K,).
-    """
-    batch_size = len(x_batch)
-
-    optimizer.zero_grad()       
-
-    noise_a = torch.randn_like(x_batch)
-    noise_b = torch.randn_like(x_batch)
-
-    xt_a = noise_scheduler.add_noise(x_batch, noise_a, t_batch)
-    xt_b = noise_scheduler.add_noise(x_batch, noise_b, t_batch)
-
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
-        phi_a = model(xt_a, t_batch)
-        phi_b = model(xt_b, t_batch)
-
-        phi_a_f32 = phi_a.float()
-        phi_b_f32 = phi_b.float()
-
-        alignment = -2.0 * (phi_a_f32 * phi_b_f32).sum(dim=1).mean()
-
-        cov_matrix_a = (phi_a_f32.T @ phi_a_f32) / batch_size
-        cov_matrix_b = (phi_b_f32.T @ phi_b_f32) / batch_size
-        
-        cov_norm = 0.5 * (cov_matrix_a.pow(2).sum() + cov_matrix_b.pow(2).sum())
-
-        loss = alignment + cov_norm
-
-    loss.backward()
+            with torch.no_grad():
+                eig_accum += eigvals_chunk.detach()
 
     if grad_clip is not None:
         clip_grad_norm_(model.parameters(), max_norm=grad_clip)
 
     optimizer.step()
-    
-    # Monitoring (Post-hoc)
-    with torch.no_grad():
-        phi_a_mu, phi_a_whitener = whitening(phi_a_f32, eps=1e-6, ridge=1e-3)
-        try:
-            eigenvalues = compute_eigenvalues(
-                phi_a_f32.detach(),
-                phi_b_f32.detach(),
-                mu=phi_a_mu,
-                whitener=phi_a_whitener,
-                normalize=True,
-            )
-        except:
-            logger.warning("Could not compute eigenvalues.")
-            eigenvalues = None
-    
-    return loss.item(), eigenvalues
+    optimizer.zero_grad()
+
+    # Average per-chunk normalized correlations across chunks (and ranks) for logging.
+    if is_distributed:
+        dist.all_reduce(eig_accum, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+    else:
+        world_size = 1
+
+    eigenvalues = eig_accum / (n_chunks_total * world_size)
+
+    if is_distributed:
+        loss_tensor = torch.tensor([total_loss], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        total_loss = loss_tensor.item()
+
+    return total_loss, eigenvalues, cov_eig
+
+
+@torch.no_grad()
+def _extract_features(
+    model,
+    loader,
+    noise_scheduler,
+    t: int,
+    device: str,
+    is_distributed: bool,
+    num_chunks: int=16,
+):
+    model.eval()
+    raw_model = model.module if hasattr(model, "module") else model
+
+    feats, labs = [], []
+    for batch in loader:
+        assert isinstance(batch, (list, tuple)) and len(batch) >= 2, \
+            "Dataset must return (image, label) for linear probe eval"
+        x = batch[0].to(device, non_blocking=True)
+        y = batch[1]
+
+        B = x.size(0)
+        t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+        noise = torch.randn_like(x)
+        x_noisy = noise_scheduler.add_noise(x, noise, t_batch)
+        del noise
+
+        chunk_phis = []
+        for xc, tc in zip(x_noisy.chunk(num_chunks), t_batch.chunk(num_chunks)):
+            chunk_phis.append(raw_model(xc, tc).float().cpu())
+        feats.append(torch.cat(chunk_phis, dim=0))
+        labs.append(y.cpu())
+        del x, x_noisy, t_batch
+
+    features = torch.cat(feats, dim=0)
+    labels = torch.cat(labs, dim=0)
+
+    if is_distributed:
+        ws = dist.get_world_size()
+        f_dev, l_dev = features.to(device), labels.to(device)
+        f_list = [torch.zeros_like(f_dev) for _ in range(ws)]
+        l_list = [torch.zeros_like(l_dev) for _ in range(ws)]
+        dist.all_gather(f_list, f_dev)
+        dist.all_gather(l_list, l_dev)
+        features = torch.cat(f_list, dim=0).cpu()
+        labels = torch.cat(l_list, dim=0).cpu()
+
+    return features.numpy(), labels.numpy()
+
+
+def coefficient_eval(
+    model,
+    loader,
+    noise_scheduler,
+    t: int,
+    label_indices,
+    device: str,
+    ridge: float,
+    is_distributed: bool=False,
+    local_rank: int=0,
+):
+    """
+    At timestep t, extract features, whiten them so they form an orthonormal
+    basis in empirical L²(p_t), then for each attribute h compute:
+      - energy_ratio = ||c||² / Var(h)   ∈ [0, 1], recoverable fraction
+
+    Returns {attr_idx: {...}} on rank 0, None elsewhere. Collective — call on
+    all ranks when distributed.
+    """
+    X, Y = _extract_features(model, loader, noise_scheduler, t, device, is_distributed)
+
+    if Y.ndim == 1:
+        num_classes = int(Y.max()) + 1
+        Y = np.eye(num_classes, dtype=np.float64)[Y.astype(int)]
+
+    if is_distributed and local_rank != 0:
+        return None
+
+    X = X.astype(np.float64)
+    N, K = X.shape
+    Xc = X - X.mean(axis=0, keepdims=True)
+
+    # Whitening transform from the same covariance used in training
+    Sigma = (Xc.T @ Xc) / (N - 1)
+    eigvals, eigvecs = np.linalg.eigh(Sigma + ridge * np.eye(K))
+    W = eigvecs * (1.0 / np.sqrt(np.clip(eigvals, 1e-12, None)))  # (K, K)
+    Xw = Xc @ W  # (N, K), empirical cov ≈ I
+    Xw = Xw / np.std(Xw, axis=0, keepdims=True)
+
+    results = {}
+    for label_idx in label_indices:
+        h = Y[:, label_idx].astype(np.float64)
+        h_c = h - h.mean()
+        var_h = float((h_c ** 2).mean())
+        if var_h < 1e-12:
+            logger.warning(f"Label {label_idx}: constant label, skipping")
+            continue
+
+        c = (Xw.T @ h_c) / N    # (K,) MC estimate of c_{t,k}
+        c_sq = c ** 2
+        energy = float(c_sq.sum())
+
+        results[int(label_idx)] = {
+            "energy_ratio": energy / var_h,
+        }
+
+    return results
